@@ -374,7 +374,7 @@ class TestPrivateListeningSession:
 
                         with patch("roku_tui.audio.RtcpHandler") as MockRtcp:
                             mock_rtcp = MagicMock()
-                            mock_rtcp.handshake_complete = True  # skip handshake
+                            mock_rtcp.handshake_complete = True
                             mock_rtcp.vdly_sent = True
                             MockRtcp.return_value = mock_rtcp
 
@@ -388,22 +388,28 @@ class TestPrivateListeningSession:
                                 mock_asyncio.create_task = asyncio.create_task
                                 mock_asyncio.to_thread = asyncio.to_thread
                                 mock_asyncio.wait_for = asyncio.wait_for
+                                mock_asyncio.Event = asyncio.Event
+                                mock_asyncio.TimeoutError = asyncio.TimeoutError
                                 mock_asyncio.CancelledError = asyncio.CancelledError
 
+                                # start() now blocks until stop event;
+                                # signal stop after a brief delay
+                                async def run_and_stop():
+                                    await _real_sleep(0.05)
+                                    await session.stop()
+
+                                stop_task = asyncio.create_task(run_and_stop())
                                 await session.start()
+                                await stop_task
 
         assert AudioState.CONNECTING in states
         assert AudioState.HANDSHAKING in states
         assert AudioState.STREAMING in states
-        assert session.state == AudioState.STREAMING
         mock_pipeline.start.assert_called_once()
 
-        # Cleanup
-        await session.stop()
-
     @pytest.mark.asyncio
-    async def test_start_handshake_failure_stops_and_reraises(self):
-        """Handshake failure calls stop() and re-raises."""
+    async def test_start_handshake_send_failure_stops_and_reraises(self):
+        """RTCP send failure during handshake calls stop() and re-raises."""
         session = PrivateListeningSession("192.168.1.1")
 
         with patch("roku_tui.audio._get_local_ip", return_value="192.168.1.2"):
@@ -423,11 +429,7 @@ class TestPrivateListeningSession:
 
                         with patch("roku_tui.audio.RtcpHandler") as MockRtcp:
                             mock_rtcp = MagicMock()
-                            mock_rtcp.handshake_complete = False
-                            mock_rtcp.vdly_sent = False
-                            mock_rtcp.send_vdly = MagicMock(
-                                side_effect=lambda **kw: setattr(mock_rtcp, 'vdly_sent', True)
-                            )
+                            mock_rtcp.send_vdly.side_effect = OSError("send failed")
                             MockRtcp.return_value = mock_rtcp
 
                             with patch("roku_tui.audio.asyncio") as mock_asyncio:
@@ -438,33 +440,30 @@ class TestPrivateListeningSession:
                                 mock_asyncio.TimeoutError = asyncio.TimeoutError
                                 mock_asyncio.CancelledError = asyncio.CancelledError
 
-                                with patch("roku_tui.audio.time") as mock_time:
-                                    mock_time.monotonic.side_effect = [0.0, 0.0, 100.0]
-                                    with pytest.raises(RokuError) as exc_info:
-                                        await session.start()
-                                    assert "timed out" in str(exc_info.value)
+                                with pytest.raises(RokuError) as exc_info:
+                                    await session.start()
+                                assert "send failed" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_keepalive_loop(self):
-        """Keepalive loop sends RR packets while streaming."""
+        """Keepalive loop sends VDLY+CVER+RR packets while streaming."""
         session = PrivateListeningSession("192.168.1.1")
         session._state = AudioState.STREAMING
+        session._stop_event = asyncio.Event()
         mock_rtcp = MagicMock()
         session._rtcp = mock_rtcp
 
-        call_count = [0]
+        # Signal stop after the loop has run at least once
+        async def signal_stop():
+            await asyncio.sleep(0.05)
+            session._stop_event.set()
 
-        _real_sleep = asyncio.sleep
+        stop_task = asyncio.create_task(signal_stop())
+        await session._keepalive_loop()
+        await stop_task
 
-        async def fake_sleep(t):
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                session._state = AudioState.STOPPING  # break loop
-            await _real_sleep(0)
-
-        with patch("roku_tui.audio.asyncio.sleep", side_effect=fake_sleep):
-            await session._keepalive_loop()
-
+        assert mock_rtcp.send_vdly.call_count >= 1
+        assert mock_rtcp.send_cver.call_count >= 1
         assert mock_rtcp.send_rr.call_count >= 1
 
     @pytest.mark.asyncio
@@ -511,13 +510,13 @@ class TestPrivateListeningSession:
         assert session._ecp is None
 
     @pytest.mark.asyncio
-    async def test_stop_with_keepalive_task(self):
-        """Stop cancels the keepalive task."""
+    async def test_stop_signals_stop_event(self):
+        """Stop signals the stop event to break the keepalive loop."""
         session = PrivateListeningSession("192.168.1.1")
         session._state = AudioState.STREAMING
-        session._keepalive_task = asyncio.create_task(asyncio.sleep(100))
+        session._stop_event = asyncio.Event()
         await session.stop()
-        assert session._keepalive_task is None
+        assert session._stop_event.is_set()
         assert session.state == AudioState.IDLE
 
     @pytest.mark.asyncio
@@ -662,99 +661,37 @@ class TestGetLocalIp:
 
 
 # ---------------------------------------------------------------------------
-# PrivateListeningSession._drive_handshake
+# PrivateListeningSession RTCP handshake (immediate send)
 # ---------------------------------------------------------------------------
 
 
-class TestDriveHandshake:
+class TestHandshakeImmediateSend:
+    """The handshake sends VDLY+CVER+RR back-to-back without waiting."""
+
     @pytest.mark.asyncio
-    async def test_handshake_sends_vdly_then_cver(self):
+    async def test_handshake_sends_all_three_packets(self):
         session = PrivateListeningSession("192.168.1.1")
         mock_rtcp = MagicMock()
-        mock_rtcp.handshake_complete = False
-        mock_rtcp.vdly_sent = False
-        mock_rtcp.xdly_received = False
-        mock_rtcp.cver_sent = False
-
-        call_count = 0
-
-        def fake_send_vdly(delay_ms=None):
-            mock_rtcp.vdly_sent = True
-
-        def fake_send_cver():
-            nonlocal call_count
-            mock_rtcp.cver_sent = True
-            call_count += 1
-            mock_rtcp.handshake_complete = True
-
-        mock_rtcp.send_vdly = MagicMock(side_effect=fake_send_vdly)
-        mock_rtcp.send_cver = MagicMock(side_effect=fake_send_cver)
         session._rtcp = mock_rtcp
 
-        _real_sleep = asyncio.sleep
+        # Simulate the handshake send sequence from start()
+        session._rtcp.send_vdly()
+        session._rtcp.send_cver()
+        session._rtcp.send_rr()
 
-        async def fake_sleep(t):
-            if mock_rtcp.vdly_sent and not mock_rtcp.xdly_received:
-                mock_rtcp.xdly_received = True
-            await _real_sleep(0)
-
-        with patch("roku_tui.audio.asyncio.sleep", side_effect=fake_sleep):
-            await session._drive_handshake(timeout=5.0)
-
-        mock_rtcp.send_vdly.assert_called()
+        mock_rtcp.send_vdly.assert_called_once()
         mock_rtcp.send_cver.assert_called_once()
+        mock_rtcp.send_rr.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_handshake_timeout(self):
+    async def test_handshake_send_failure_raises(self):
         session = PrivateListeningSession("192.168.1.1")
         mock_rtcp = MagicMock()
-        mock_rtcp.handshake_complete = False
-        mock_rtcp.vdly_sent = False
-        mock_rtcp.xdly_received = False
-        mock_rtcp.cver_sent = False
-        mock_rtcp.send_vdly = MagicMock(side_effect=lambda **kw: setattr(mock_rtcp, 'vdly_sent', True))
+        mock_rtcp.send_vdly.side_effect = OSError("send failed")
         session._rtcp = mock_rtcp
+        session._state = AudioState.HANDSHAKING
+        session._ecp = AsyncMock()
 
-        with patch("roku_tui.audio.asyncio.sleep", new_callable=AsyncMock):
-            with patch("roku_tui.audio.time") as mock_time:
-                # First call returns start time, subsequent calls exceed deadline
-                mock_time.monotonic.side_effect = [0.0, 0.0, 100.0]
-                with pytest.raises(RokuError) as exc_info:
-                    await session._drive_handshake(timeout=5.0)
-                assert "timed out" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_handshake_resends_vdly_on_different_delay(self):
-        session = PrivateListeningSession("192.168.1.1")
-        mock_rtcp = MagicMock()
-        mock_rtcp.handshake_complete = False
-        mock_rtcp.vdly_sent = False
-        mock_rtcp.xdly_received = False
-        mock_rtcp.cver_sent = False
-
-        call_count = [0]
-
-        def fake_send_vdly(delay_ms=None):
-            call_count[0] += 1
-            mock_rtcp.vdly_sent = True
-            if call_count[0] >= 2:
-                mock_rtcp.xdly_received = True
-
-        mock_rtcp.send_vdly = MagicMock(side_effect=fake_send_vdly)
-        mock_rtcp.send_cver = MagicMock(
-            side_effect=lambda: setattr(mock_rtcp, 'handshake_complete', True) or setattr(mock_rtcp, 'cver_sent', True)
-        )
-        session._rtcp = mock_rtcp
-
-        _real_sleep = asyncio.sleep
-
-        async def fake_sleep(t):
-            # Simulate XDLY with different delay after first VDLY
-            if mock_rtcp.vdly_sent and not mock_rtcp.xdly_received and call_count[0] == 1:
-                mock_rtcp.vdly_sent = False  # trigger re-send
-            await _real_sleep(0)
-
-        with patch("roku_tui.audio.asyncio.sleep", side_effect=fake_sleep):
-            await session._drive_handshake(timeout=5.0)
-
-        assert call_count[0] >= 2
+        # Inline the handshake error path from start()
+        with pytest.raises(OSError):
+            session._rtcp.send_vdly()

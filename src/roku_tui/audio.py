@@ -12,7 +12,6 @@ import asyncio
 import logging
 import socket
 import struct
-import time
 from enum import Enum, auto
 
 from .ecp_session import (
@@ -132,23 +131,43 @@ class AudioPipeline:
 
         Intended to run in a thread via asyncio.to_thread().
         """
+        pkt_count = 0
+        decode_count = 0
+        err_count = 0
         while self._running:
             try:
-                data, _ = self._rtp_sock.recvfrom(4096)
+                data, addr = self._rtp_sock.recvfrom(4096)
             except socket.timeout:
                 continue
             except OSError:
                 break
 
+            pkt_count += 1
+            if pkt_count <= 3 or pkt_count % 500 == 0:
+                log.debug(
+                    "RTP pkt #%d: %d bytes from %s, header=%s",
+                    pkt_count, len(data), addr, data[:12].hex(),
+                )
+
             payload = _parse_rtp_payload(data)
             if payload is None:
+                if pkt_count <= 10:
+                    log.debug("RTP pkt #%d: payload parse returned None", pkt_count)
                 continue
 
             try:
                 pcm = self._decoder.decode(payload, _OPUS_FRAME_SIZE)
                 self._stream.write(pcm)
-            except Exception:
-                log.debug("Opus decode/playback error", exc_info=True)
+                decode_count += 1
+            except Exception as exc:
+                err_count += 1
+                if err_count <= 5:
+                    log.warning("Opus decode error #%d: %s (payload %d bytes)", err_count, exc, len(payload))
+
+        log.debug(
+            "RTP loop exited: %d packets received, %d decoded, %d errors",
+            pkt_count, decode_count, err_count,
+        )
 
     def stop(self) -> None:
         """Stop the audio pipeline and release resources."""
@@ -211,14 +230,14 @@ class RtcpHandler:
         pkt = build_rtcp_app_packet(RtcpAppName.VDLY.value, data)
         self._send_sock.sendto(pkt, (self.roku_ip, RTCP_PORT))
         self.vdly_sent = True
-        log.debug("Sent VDLY: %d ms", self.delay_ms)
+        log.debug("Sent VDLY: %d ms to %s:%d", self.delay_ms, self.roku_ip, RTCP_PORT)
 
     def send_cver(self) -> None:
         """Send CVER (client version) APP packet."""
         pkt = build_rtcp_app_packet(RtcpAppName.CVER.value, b"0002")
         self._send_sock.sendto(pkt, (self.roku_ip, RTCP_PORT))
         self.cver_sent = True
-        log.debug("Sent CVER")
+        log.debug("Sent CVER to %s:%d", self.roku_ip, RTCP_PORT)
 
     def send_bye(self) -> None:
         """Send RTCP BYE to end the session."""
@@ -299,7 +318,8 @@ class PrivateListeningSession:
         self._rtcp_recv_sock: socket.socket | None = None
         self._rtp_task: asyncio.Task | None = None
         self._rtcp_task: asyncio.Task | None = None
-        self._keepalive_task: asyncio.Task | None = None
+        self._ws_task: asyncio.Task | None = None
+        self._stop_event: asyncio.Event | None = None
 
     @property
     def state(self) -> AudioState:
@@ -311,7 +331,11 @@ class PrivateListeningSession:
             self._state_callback(state)
 
     async def start(self) -> None:
-        """Start private listening: auth, handshake, and stream.
+        """Start private listening: auth, handshake, stream, and keepalive.
+
+        This method does NOT return until stop() is called (or an error
+        occurs).  It runs the keepalive loop inline so the calling Textual
+        worker stays alive, keeping all background tasks running.
 
         Raises:
             RokuError: On connection, auth, or pipeline errors.
@@ -319,6 +343,7 @@ class PrivateListeningSession:
         if self._state not in (AudioState.IDLE, AudioState.ERROR):
             return
 
+        self._stop_event = asyncio.Event()
         self._set_state(AudioState.CONNECTING)
 
         try:
@@ -337,7 +362,13 @@ class PrivateListeningSession:
             self._set_state(AudioState.ERROR)
             raise
 
+        # 1b. Keep consuming WebSocket messages so the Roku doesn't
+        # consider the client dead and drop the audio session.
+        self._ws_task = asyncio.create_task(self._ecp.run_message_loop())
+
         # 2. Create UDP sockets
+        log.debug("Binding RTP socket to 0.0.0.0:%d, RTCP to 0.0.0.0:%d", RTP_PORT, RTCP_APP_PORT)
+        log.debug("Receiver IP: %s, Roku: %s:%d", receiver_ip, self.roku_ip, self.roku_port)
         try:
             self._rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -382,7 +413,7 @@ class PrivateListeningSession:
             asyncio.to_thread(self._rtcp.receive_loop)
         )
 
-        # 6. Drive RTCP handshake
+        # 6. Drive RTCP handshake: VDLY → wait for XDLY → CVER → RR
         try:
             await self._drive_handshake()
         except Exception as exc:
@@ -392,45 +423,74 @@ class PrivateListeningSession:
                 raise
             raise RokuError(ErrorCode.E1011, str(exc)) from exc
 
-        # 7. Start keepalive
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        # 7. Run keepalive inline — this blocks until stop() signals.
         self._set_state(AudioState.STREAMING)
+        log.debug("Entering keepalive loop")
+        await self._keepalive_loop()
 
-    async def _drive_handshake(self, timeout: float = 10.0) -> None:
-        """Drive the RTCP handshake sequence (VDLY → XDLY → CVER → NCLI)."""
+    async def _drive_handshake(self, timeout: float = 5.0) -> None:
+        """Drive the RTCP handshake: VDLY → wait for XDLY → CVER → RR."""
+        import time
+
         deadline = time.monotonic() + timeout
 
-        # Wait for SSRC to be established
-        await asyncio.sleep(1.0)
-
+        # Step 1: Send VDLY
         self._rtcp.send_vdly()
 
-        while not self._rtcp.handshake_complete:
+        # Step 2: Wait for XDLY confirmation
+        while not self._rtcp.xdly_received:
             if time.monotonic() > deadline:
-                raise RokuError(ErrorCode.E1011, "RTCP handshake timed out")
+                # Proceed anyway — some Roku firmwares may not send XDLY
+                log.warning("XDLY not received within timeout, proceeding")
+                break
+            await asyncio.sleep(0.1)
 
-            # Re-send VDLY if Roku responded with different delay
-            if not self._rtcp.vdly_sent:
-                self._rtcp.send_vdly()
+        # Step 3: Send CVER + RR
+        self._rtcp.send_cver()
+        self._rtcp.send_rr()
 
-            # Send CVER after receiving XDLY
-            if (
-                self._rtcp.vdly_sent
-                and self._rtcp.xdly_received
-                and not self._rtcp.cver_sent
-            ):
-                self._rtcp.send_cver()
-
-            await asyncio.sleep(0.2)
+        # Step 4: Brief wait for NCLI (optional, don't block on it)
+        for _ in range(10):
+            if self._rtcp.ncli_received:
+                log.debug("NCLI received, handshake complete")
+                break
+            await asyncio.sleep(0.1)
+        else:
+            log.warning("NCLI not received, proceeding anyway")
 
     async def _keepalive_loop(self) -> None:
-        """Periodically send RTCP RR to keep the session alive."""
+        """Periodically send RTCP to keep the session alive.
+
+        Both reference implementations send more than just RR:
+          - RPListening sends VDLY + CVER + RR every cycle
+          - roku-audio-receiver sends compound RR + SDES via GStreamer at ~200ms
+        We match RPListening's approach at 500ms intervals.
+
+        Runs until the stop event is set or the session state changes.
+        """
         try:
             while self._rtcp and self._state == AudioState.STREAMING:
-                self._rtcp.send_rr()
-                await asyncio.sleep(5.0)
+                try:
+                    self._rtcp.send_vdly()
+                    self._rtcp.send_cver()
+                    self._rtcp.send_rr()
+                except OSError as exc:
+                    log.warning("Keepalive send error: %s", exc)
+                    break
+                # Wait 500ms or until stop is signalled
+                if self._stop_event:
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=0.5
+                        )
+                        break  # stop was signalled
+                    except asyncio.TimeoutError:
+                        pass  # normal — send next keepalive
+                else:
+                    await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass
+        log.debug("Keepalive loop exited")
 
     async def stop(self) -> None:
         """Stop private listening and clean up all resources."""
@@ -439,14 +499,9 @@ class PrivateListeningSession:
 
         self._set_state(AudioState.STOPPING)
 
-        # Cancel keepalive
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._keepalive_task = None
+        # Signal keepalive loop to exit
+        if self._stop_event:
+            self._stop_event.set()
 
         # Send BYE
         if self._rtcp:
@@ -475,7 +530,14 @@ class PrivateListeningSession:
         self._rtp_task = None
         self._rtcp_task = None
 
-        # Close WebSocket
+        # Cancel WebSocket consumer and close
+        if self._ws_task:
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._ws_task = None
         if self._ecp:
             await self._ecp.close()
             self._ecp = None

@@ -653,6 +653,7 @@ class RemoteScreen(Screen):
         )
 
         try:
+            # start() blocks until stop() is called or error occurs
             await self._listening_session.start()
         except RokuError as exc:
             if exc.error_code.code == "E1015":
@@ -664,6 +665,9 @@ class RemoteScreen(Screen):
             else:
                 listen_status.update(f"[bold red]Error:[/] {exc}")
             self._listening_session = None
+        except asyncio.CancelledError:
+            # Worker cancelled by _stop_listening (exclusive=True)
+            pass
         except Exception as exc:
             listen_status.update(f"[bold red]Failed:[/] {exc}")
             self._listening_session = None

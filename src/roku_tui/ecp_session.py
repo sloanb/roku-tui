@@ -116,11 +116,20 @@ def build_rtcp_bye_packet(ssrc: int = 0) -> bytes:
 
 
 def build_rtcp_rr_packet(ssrc: int = 0) -> bytes:
-    """Build a minimal RTCP RR (Receiver Report) packet for keepalive."""
-    # V=2, P=0, RC=0 | PT=201 | length=1
-    header = struct.pack("!BBH", 0x80, RTCP_RR, 1)
+    """Build an RTCP RR (Receiver Report) packet with one empty report block.
+
+    Matches the 32-byte format used by RPListening:
+      [0]    V=2, P=0, RC=1
+      [1]    PT=201
+      [2-3]  length=7 (8 words = 32 bytes)
+      [4-7]  SSRC of sender
+      [8-31] one 24-byte report block (zeroed)
+    """
+    # V=2, P=0, RC=1 | PT=201 | length=7
+    header = struct.pack("!BBH", 0x81, RTCP_RR, 7)
     ssrc_bytes = struct.pack("!I", ssrc)
-    return header + ssrc_bytes
+    report_block = b"\x00" * 24
+    return header + ssrc_bytes + report_block
 
 
 def parse_rtcp_app_packet(data: bytes) -> tuple[str, bytes] | None:
@@ -187,7 +196,7 @@ class EcpSession:
         try:
             async for message in self._ws:
                 msg = json.loads(message)
-                log.debug("ECP received: %s", msg)
+                log.debug("ECP connect msg: %s", msg)
 
                 if "param-challenge" in msg:
                     response = compute_auth_response(msg["param-challenge"])
@@ -211,11 +220,20 @@ class EcpSession:
                             "request": "set-audio-output",
                         })
                         self._audio_requested = True
-                        return
+                        # Don't return yet — wait for set-audio-output response
                     else:
                         raise RokuError(
                             ErrorCode.E1013,
                             f"Auth status: {msg.get('status')}",
+                        )
+
+                elif msg.get("response") == "set-audio-output":
+                    if msg.get("status") == "200":
+                        return  # Roku confirmed audio — ready for RTCP
+                    else:
+                        raise RokuError(
+                            ErrorCode.E1011,
+                            f"set-audio-output rejected: {msg.get('status')}",
                         )
         except RokuError:
             raise
@@ -229,6 +247,23 @@ class EcpSession:
         msg = json.dumps(obj)
         log.debug("ECP sending: %s", msg)
         await self._ws.send(msg)
+
+    async def run_message_loop(self) -> None:
+        """Consume WebSocket messages to keep the connection alive.
+
+        The Roku sends pings and status messages over the WebSocket.
+        If nothing reads them, the Roku considers the client dead and
+        drops the audio session after ~5 seconds.  Run this as a
+        background task for the lifetime of the private listening session.
+        """
+        if not self._ws:
+            return
+        try:
+            async for message in self._ws:
+                msg = json.loads(message)
+                log.debug("ECP WS message: %s", msg)
+        except Exception as exc:
+            log.debug("ECP WS loop ended: %s", exc)
 
     async def close(self) -> None:
         """Close the WebSocket connection."""

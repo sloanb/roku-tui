@@ -152,14 +152,20 @@ class TestBuildRtcpByePacket:
 
 
 class TestBuildRtcpRrPacket:
-    def test_packet_is_8_bytes(self):
+    def test_packet_is_32_bytes(self):
         pkt = build_rtcp_rr_packet()
-        assert len(pkt) == 8
+        assert len(pkt) == 32
 
     def test_header_fields(self):
         pkt = build_rtcp_rr_packet()
-        assert pkt[0] == 0x80  # V=2, P=0, RC=0
+        assert pkt[0] == 0x81  # V=2, P=0, RC=1
         assert pkt[1] == RTCP_RR  # PT=201
+        length = struct.unpack("!H", pkt[2:4])[0]
+        assert length == 7  # 8 words = 32 bytes
+
+    def test_report_block_is_zeroed(self):
+        pkt = build_rtcp_rr_packet()
+        assert pkt[8:32] == b"\x00" * 24
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +237,7 @@ class TestEcpSession:
 
     @pytest.mark.asyncio
     async def test_connect_auth_success(self):
-        """Simulate a full auth flow: challenge → auth response → set-audio-output."""
+        """Simulate a full auth flow: challenge → auth → set-audio-output → OK."""
         import json
 
         challenge_msg = json.dumps({
@@ -243,11 +249,16 @@ class TestEcpSession:
             "status": "200",
             "request-id": "1",
         })
+        audio_ok_msg = json.dumps({
+            "response": "set-audio-output",
+            "status": "200",
+            "request-id": "2",
+        })
 
         mock_ws = AsyncMock()
         mock_ws.send = AsyncMock()
         mock_ws.__aiter__ = MagicMock(
-            return_value=_AsyncIter([challenge_msg, auth_ok_msg])
+            return_value=_AsyncIter([challenge_msg, auth_ok_msg, audio_ok_msg])
         )
 
         mock_ws_module = MagicMock()
@@ -272,6 +283,36 @@ class TestEcpSession:
         assert audio_call["request"] == "set-audio-output"
         assert audio_call["param-audio-output"] == "datagram"
         assert "6970" in audio_call["param-devname"]
+
+    @pytest.mark.asyncio
+    async def test_connect_audio_output_rejected(self):
+        """set-audio-output rejection raises E1011."""
+        import json
+
+        challenge_msg = json.dumps({"param-challenge": "test"})
+        auth_ok_msg = json.dumps({
+            "response": "authenticate",
+            "status": "200",
+        })
+        audio_fail_msg = json.dumps({
+            "response": "set-audio-output",
+            "status": "403",
+        })
+
+        mock_ws = AsyncMock()
+        mock_ws.send = AsyncMock()
+        mock_ws.__aiter__ = MagicMock(
+            return_value=_AsyncIter([challenge_msg, auth_ok_msg, audio_fail_msg])
+        )
+
+        mock_ws_module = MagicMock()
+        mock_ws_module.connect = AsyncMock(return_value=mock_ws)
+
+        session = EcpSession("192.168.1.1")
+        with patch.dict("sys.modules", {"websockets": mock_ws_module}):
+            with pytest.raises(RokuError) as exc_info:
+                await session.connect("192.168.1.2")
+            assert exc_info.value.error_code is ErrorCode.E1011
 
     @pytest.mark.asyncio
     async def test_connect_auth_failure(self):
