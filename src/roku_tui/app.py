@@ -622,7 +622,11 @@ class RemoteScreen(Screen):
         try:
             from .audio import PrivateListeningSession
         except ImportError:
-            listen_status.update("[yellow]Install: pip install roku-tui\\[audio][/]")
+            from rich.text import Text
+
+            listen_status.update(
+                Text("Install: pip install roku-tui[audio]", style="yellow")
+            )
             return
 
         def on_state(state):
@@ -652,8 +656,10 @@ class RemoteScreen(Screen):
             await self._listening_session.start()
         except RokuError as exc:
             if exc.error_code.code == "E1015":
+                from rich.text import Text
+
                 listen_status.update(
-                    "[yellow]Install: pip install roku-tui\\[audio][/]"
+                    Text("Install: pip install roku-tui[audio]", style="yellow")
                 )
             else:
                 listen_status.update(f"[bold red]Error:[/] {exc}")
