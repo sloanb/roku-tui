@@ -11,6 +11,11 @@ Error Code Reference:
     E1008 - Device unreachable
     E1009 - Response parse error (malformed XML)
     E1010 - Socket error (low-level network issue)
+    E1011 - Audio session failed (private listening lifecycle error)
+    E1012 - WebSocket error (ECP-2 session transport)
+    E1013 - Authentication failed (ECP-2 challenge-response)
+    E1014 - Audio pipeline error (RTP/Opus/playback)
+    E1015 - Audio dependency missing (optional packages not installed)
 """
 
 from enum import Enum
@@ -29,6 +34,11 @@ class ErrorCode(Enum):
     E1008 = ("E1008", "Device unreachable", "The Roku device is not reachable on the network")
     E1009 = ("E1009", "Parse error", "Failed to parse device response data")
     E1010 = ("E1010", "Socket error", "Network socket operation failed")
+    E1011 = ("E1011", "Audio session failed", "Private listening session encountered an error")
+    E1012 = ("E1012", "WebSocket error", "ECP-2 WebSocket session transport error")
+    E1013 = ("E1013", "Auth failed", "ECP-2 challenge-response authentication failed")
+    E1014 = ("E1014", "Audio pipeline error", "RTP receive or audio playback pipeline error")
+    E1015 = ("E1015", "Audio deps missing", "Optional audio packages not installed")
 
     def __init__(self, code: str, message: str, description: str):
         self.code = code

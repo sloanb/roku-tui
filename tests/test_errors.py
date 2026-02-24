@@ -24,7 +24,7 @@ class TestErrorCode:
         assert ErrorCode.E1007.message == "Network timeout"
 
     def test_all_codes_present(self):
-        expected = [f"E{i}" for i in range(1001, 1011)]
+        expected = [f"E{i}" for i in range(1001, 1016)]
         actual = [m.code for m in ErrorCode]
         assert actual == expected
 

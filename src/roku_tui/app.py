@@ -400,6 +400,17 @@ class RemoteScreen(Screen):
         background: $warning-darken-1;
     }
 
+    .listen-btn {
+        background: $primary-darken-1;
+    }
+
+    #listen-status {
+        padding: 1 2;
+        color: $text-muted;
+        content-align: center middle;
+        height: 3;
+    }
+
     .nav-spacer {
         width: 10;
         height: 3;
@@ -423,6 +434,7 @@ class RemoteScreen(Screen):
     BINDINGS = [
         Binding("escape", "go_back", "Devices", priority=True),
         Binding("g", "open_apps", "Apps"),
+        Binding("l", "toggle_listening", "Listen"),
     ]
 
     def __init__(
@@ -436,6 +448,7 @@ class RemoteScreen(Screen):
         self._device_store = device_store
         self._device_key: str | None = None
         self._favorites: list[dict] = []  # resolved dicts with id+name
+        self._listening_session = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -485,12 +498,18 @@ class RemoteScreen(Screen):
                 yield RemoteButton("Mute", id="btn-mute", classes="vol-btn")
                 yield RemoteButton("Vol +", id="btn-volup", classes="vol-btn")
 
+            # Private Listening
+            yield Static("-- Private Listening --", classes="section-label")
+            with Horizontal(classes="btn-row"):
+                yield RemoteButton("Listen", id="btn-listen", classes="listen-btn")
+                yield Static("Off", id="listen-status")
+
         yield Static("Ready", id="status")
         yield Static(
             "Keys: Arrows=Navigate  Enter=OK  Space=Play/Pause  "
             "h=Home  b=Back  p=Power\n"
             "r=Rewind  f=Forward  =/Vol+  -/Vol-  m=Mute  i=Info  "
-            "g=Apps  1-5=Favorites  Esc=Back to devices",
+            "l=Listen  g=Apps  1-5=Favorites  Esc=Back to devices",
             id="help-text",
         )
         yield Footer()
@@ -567,6 +586,9 @@ class RemoteScreen(Screen):
             event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-listen":
+            self.action_toggle_listening()
+            return
         if event.button.id and event.button.id.startswith("fav-"):
             try:
                 idx = int(event.button.id.split("-")[1])
@@ -586,6 +608,70 @@ class RemoteScreen(Screen):
             AppsScreen(self.device, self.remote, device_store=self._device_store),
             callback=lambda _: self._load_favorites(),
         )
+
+    def action_toggle_listening(self) -> None:
+        if self._listening_session is not None:
+            self._stop_listening()
+        else:
+            self._start_listening()
+
+    @work(exclusive=True, group="audio")
+    async def _start_listening(self) -> None:
+        listen_status = self.query_one("#listen-status", Static)
+
+        try:
+            from .audio import PrivateListeningSession
+        except ImportError:
+            listen_status.update("[yellow]Install: pip install roku-tui\\[audio][/]")
+            return
+
+        def on_state(state):
+            from .audio import AudioState
+
+            labels = {
+                AudioState.CONNECTING: "[cyan]Connecting...[/]",
+                AudioState.HANDSHAKING: "[cyan]Handshaking...[/]",
+                AudioState.STREAMING: "[green]Streaming[/]",
+                AudioState.STOPPING: "[yellow]Stopping...[/]",
+                AudioState.IDLE: "Off",
+                AudioState.ERROR: "[red]Error[/]",
+            }
+            try:
+                ls = self.query_one("#listen-status", Static)
+                ls.update(labels.get(state, str(state)))
+            except Exception:
+                pass
+
+        self._listening_session = PrivateListeningSession(
+            self.device.host,
+            self.device.port,
+            state_callback=on_state,
+        )
+
+        try:
+            await self._listening_session.start()
+        except RokuError as exc:
+            if exc.error_code.code == "E1015":
+                listen_status.update(
+                    "[yellow]Install: pip install roku-tui\\[audio][/]"
+                )
+            else:
+                listen_status.update(f"[bold red]Error:[/] {exc}")
+            self._listening_session = None
+        except Exception as exc:
+            listen_status.update(f"[bold red]Failed:[/] {exc}")
+            self._listening_session = None
+
+    @work(exclusive=True, group="audio")
+    async def _stop_listening(self) -> None:
+        if self._listening_session:
+            await self._listening_session.stop()
+            self._listening_session = None
+        try:
+            listen_status = self.query_one("#listen-status", Static)
+            listen_status.update("Off")
+        except Exception:
+            pass
 
     @work
     async def _send_key(self, key: RokuKey) -> None:
@@ -610,6 +696,9 @@ class RemoteScreen(Screen):
             status.update(f"[bold red]Failed:[/] {exc}")
 
     async def on_unmount(self) -> None:
+        if self._listening_session:
+            await self._listening_session.stop()
+            self._listening_session = None
         await self.remote.close()
 
 

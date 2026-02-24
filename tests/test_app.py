@@ -1,7 +1,7 @@
 """Tests for the TUI application screens and interactions."""
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from textual.widgets import Input, ListView, Static
@@ -951,3 +951,144 @@ class TestAppsScreen:
 
             status = apps_screen.query_one("#apps-status", Static)
             assert "E1008" in str(status.content)
+
+
+# ---------------------------------------------------------------------------
+# RemoteScreen -- private listening
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteScreenListening:
+    def _make_app_with_remote(self):
+        device = RokuDevice("Test", "Roku Ultra", "S123", "192.168.1.100")
+        return RokuTUIApp(), device
+
+    @pytest.mark.asyncio
+    async def test_listen_button_present(self):
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+            btn = screen.query_one("#btn-listen")
+            assert btn is not None
+
+    @pytest.mark.asyncio
+    async def test_listen_status_present(self):
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+            status = screen.query_one("#listen-status", Static)
+            assert "Off" in str(status.content)
+
+    @pytest.mark.asyncio
+    async def test_help_text_shows_listen(self):
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+            help_text = screen.query_one("#help-text", Static)
+            assert "l=Listen" in str(help_text.content)
+
+    @pytest.mark.asyncio
+    async def test_l_key_import_error(self):
+        """Pressing 'l' when audio deps missing shows install instructions."""
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            with patch(
+                "roku_tui.app.RemoteScreen._start_listening",
+                wraps=screen._start_listening,
+            ):
+                with patch.dict("sys.modules", {"roku_tui.audio": None}):
+                    await pilot.press("l")
+                    await pilot.pause(delay=0.5)
+
+            listen_status = screen.query_one("#listen-status", Static)
+            rendered = str(listen_status.content)
+            assert "pip install" in rendered or "audio" in rendered.lower()
+
+    @pytest.mark.asyncio
+    async def test_toggle_listening_starts_session(self):
+        """Pressing 'l' starts a private listening session."""
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            mock_session = AsyncMock()
+            mock_session.start = AsyncMock()
+            mock_session.stop = AsyncMock()
+
+            mock_cls = MagicMock(return_value=mock_session)
+            mock_audio = MagicMock()
+            mock_audio.PrivateListeningSession = mock_cls
+
+            with patch.dict("sys.modules", {"roku_tui.audio": mock_audio}):
+                await pilot.press("l")
+                await pilot.pause(delay=0.5)
+
+            mock_session.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_toggle_listening_stops_when_active(self):
+        """Pressing 'l' again stops an active listening session."""
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            # Set up an existing session
+            mock_session = AsyncMock()
+            mock_session.stop = AsyncMock()
+            screen._listening_session = mock_session
+
+            await pilot.press("l")
+            await pilot.pause(delay=0.5)
+
+            mock_session.stop.assert_called_once()
+            assert screen._listening_session is None
+
+    @pytest.mark.asyncio
+    async def test_unmount_stops_listening(self):
+        """Going back from remote screen cleans up listening session."""
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            mock_session = AsyncMock()
+            mock_session.stop = AsyncMock()
+            screen._listening_session = mock_session
+
+            with patch.object(screen.remote, "close", new_callable=AsyncMock):
+                await pilot.press("escape")
+                await pilot.pause(delay=0.5)
+
+            mock_session.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_listen_button_click_toggles(self):
+        """Clicking the listen button triggers toggle."""
+        app, device = self._make_app_with_remote()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+
+            with patch.object(
+                screen, "action_toggle_listening"
+            ) as mock_toggle:
+                btn = screen.query_one("#btn-listen")
+                btn.press()
+                await pilot.pause(delay=0.3)
+                mock_toggle.assert_called_once()
