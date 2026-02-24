@@ -17,7 +17,36 @@ from roku_tui.storage import (
     _now_iso,
     get_config_dir,
     get_local_subnet,
+    is_cache_valid,
 )
+
+
+# ---------------------------------------------------------------------------
+# is_cache_valid
+# ---------------------------------------------------------------------------
+
+class TestIsCacheValid:
+    def test_none_returns_false(self):
+        assert is_cache_valid(None) is False
+
+    def test_missing_fetched_at_returns_false(self):
+        assert is_cache_valid({"apps": []}) is False
+
+    def test_empty_fetched_at_returns_false(self):
+        assert is_cache_valid({"fetched_at": "", "apps": []}) is False
+
+    def test_recent_cache_is_valid(self):
+        cache = {"fetched_at": _now_iso(), "apps": []}
+        assert is_cache_valid(cache) is True
+
+    def test_old_cache_is_invalid(self):
+        old_ts = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        cache = {"fetched_at": old_ts, "apps": []}
+        assert is_cache_valid(cache) is False
+
+    def test_malformed_timestamp_returns_false(self):
+        cache = {"fetched_at": "not-a-date", "apps": []}
+        assert is_cache_valid(cache) is False
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +143,40 @@ class TestSavedDevice:
         # first_seen and last_seen should be valid ISO timestamps
         datetime.fromisoformat(sd.first_seen)
         datetime.fromisoformat(sd.last_seen)
+
+    def test_default_favorites_and_app_cache(self):
+        sd = SavedDevice(name="A", model="B", serial="C", host="1.2.3.4")
+        assert sd.favorites == []
+        assert sd.app_cache is None
+
+    def test_round_trip_with_favorites_and_cache(self):
+        cache = {"fetched_at": _now_iso(), "apps": [{"id": "12", "name": "Netflix"}]}
+        sd = SavedDevice(
+            name="A", model="B", serial="C", host="1.2.3.4",
+            favorites=["12", "13"],
+            app_cache=cache,
+        )
+        d = sd.to_dict()
+        restored = SavedDevice.from_dict(d)
+        assert restored.favorites == ["12", "13"]
+        assert restored.app_cache == cache
+
+    def test_from_dict_old_format_no_favorites_or_cache(self):
+        data = {"name": "Old", "model": "M", "serial": "S", "host": "10.0.0.1"}
+        sd = SavedDevice.from_dict(data)
+        assert sd.favorites == []
+        assert sd.app_cache is None
+
+    def test_from_dict_non_list_favorites_defaults_to_empty(self):
+        data = {"name": "A", "model": "B", "serial": "C", "host": "1.2.3.4", "favorites": "bad"}
+        sd = SavedDevice.from_dict(data)
+        assert sd.favorites == []
+
+    def test_to_dict_omits_app_cache_when_none(self):
+        sd = SavedDevice(name="A", model="B", serial="C", host="1.2.3.4")
+        d = sd.to_dict()
+        assert "app_cache" not in d
+        assert d["favorites"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -344,3 +407,63 @@ class TestDeviceStore:
         assert len(loaded) == 2
         assert "S1" in loaded
         assert "S2" in loaded
+
+    def test_set_favorites(self, tmp_path):
+        store = DeviceStore(tmp_path / "devices.json")
+        store.load()
+        device = RokuDevice(name="R", model="M", serial="S1", host="10.0.0.1")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        store.set_favorites("S1", ["12", "13", "14"])
+        assert store.devices["S1"].favorites == ["12", "13", "14"]
+
+    def test_set_favorites_truncates_to_five(self, tmp_path):
+        store = DeviceStore(tmp_path / "devices.json")
+        store.load()
+        device = RokuDevice(name="R", model="M", serial="S1", host="10.0.0.1")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        store.set_favorites("S1", ["1", "2", "3", "4", "5", "6", "7"])
+        assert len(store.devices["S1"].favorites) == 5
+
+    def test_set_favorites_nonexistent_key(self, tmp_path):
+        store = DeviceStore(tmp_path / "devices.json")
+        store.load()
+        # Should not raise
+        store.set_favorites("NOPE", ["12"])
+
+    def test_set_app_cache(self, tmp_path):
+        store = DeviceStore(tmp_path / "devices.json")
+        store.load()
+        device = RokuDevice(name="R", model="M", serial="S1", host="10.0.0.1")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        apps = [{"id": "12", "name": "Netflix"}]
+        store.set_app_cache("S1", apps)
+        cache = store.devices["S1"].app_cache
+        assert cache is not None
+        assert cache["apps"] == apps
+        assert "fetched_at" in cache
+
+    def test_set_app_cache_nonexistent_key(self, tmp_path):
+        store = DeviceStore(tmp_path / "devices.json")
+        store.load()
+        # Should not raise
+        store.set_app_cache("NOPE", [])
+
+    def test_favorites_and_cache_persist_through_save_load(self, tmp_path):
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        device = RokuDevice(name="R", model="M", serial="S1", host="10.0.0.1")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        store.set_favorites("S1", ["12", "13"])
+        store.set_app_cache("S1", [{"id": "12", "name": "Netflix"}])
+        store.save()
+
+        store2 = DeviceStore(path)
+        loaded = store2.load()
+        assert loaded["S1"].favorites == ["12", "13"]
+        assert loaded["S1"].app_cache is not None
+        assert loaded["S1"].app_cache["apps"] == [{"id": "12", "name": "Netflix"}]

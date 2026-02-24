@@ -4,9 +4,10 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from textual.widgets import Input, ListView
+from textual.widgets import Input, ListView, Static
 
 from roku_tui.app import (
+    AppsScreen,
     DeviceScreen,
     RemoteButton,
     RemoteScreen,
@@ -528,3 +529,425 @@ class TestDeviceScreenPersistence:
         # Verify last_connected was written to disk
         data = json.loads(path.read_text())
         assert data["devices"]["SEL1"]["last_connected"] is not None
+
+
+# ---------------------------------------------------------------------------
+# RemoteScreen -- favorites bar
+# ---------------------------------------------------------------------------
+
+class TestRemoteScreenFavorites:
+    def _make_store_with_device(self, tmp_path, favorites=None, app_cache=None):
+        """Helper: create a DeviceStore with one device, optional favorites/cache."""
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        device = RokuDevice("Test", "Roku Ultra", "S123", "192.168.1.100")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        if favorites:
+            store.set_favorites("S123", favorites)
+        if app_cache is not None:
+            store._devices["S123"].app_cache = app_cache
+        store.save()
+        return DeviceStore(path), device
+
+    @pytest.mark.asyncio
+    async def test_accepts_device_store(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause()
+            assert isinstance(app.screen, RemoteScreen)
+            assert app.screen._device_store is store
+
+    @pytest.mark.asyncio
+    async def test_works_without_device_store(self):
+        app = RokuTUIApp()
+        device = RokuDevice("Test", "Roku Ultra", "S123", "192.168.1.100")
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device)
+            app.push_screen(screen)
+            await pilot.pause()
+            assert isinstance(app.screen, RemoteScreen)
+
+    @pytest.mark.asyncio
+    async def test_favorites_bar_shows_hint_when_empty(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause(delay=0.3)
+            bar = screen.query_one("#favorites-bar")
+            hint = bar.query(".fav-hint")
+            assert len(hint) == 1
+
+    @pytest.mark.asyncio
+    async def test_favorites_bar_shows_buttons_when_populated(self, tmp_path):
+        from roku_tui.storage import _now_iso
+        cache = {
+            "fetched_at": _now_iso(),
+            "apps": [
+                {"id": "12", "name": "Netflix"},
+                {"id": "13", "name": "YouTube"},
+            ],
+        }
+        store, device = self._make_store_with_device(
+            tmp_path, favorites=["12", "13"], app_cache=cache
+        )
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause(delay=0.3)
+            bar = screen.query_one("#favorites-bar")
+            btns = bar.query(".fav-btn")
+            assert len(btns) == 2
+
+    @pytest.mark.asyncio
+    async def test_digit_key_launches_favorite(self, tmp_path):
+        from roku_tui.storage import _now_iso
+        cache = {
+            "fetched_at": _now_iso(),
+            "apps": [{"id": "12", "name": "Netflix"}],
+        }
+        store, device = self._make_store_with_device(
+            tmp_path, favorites=["12"], app_cache=cache
+        )
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause(delay=0.3)
+            with patch.object(screen.remote, "launch_app", new_callable=AsyncMock) as mock_launch:
+                await pilot.press("1")
+                await pilot.pause(delay=0.5)
+                mock_launch.assert_called_with("12")
+
+    @pytest.mark.asyncio
+    async def test_digit_key_ignored_when_slot_empty(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause(delay=0.3)
+            with patch.object(screen.remote, "launch_app", new_callable=AsyncMock) as mock_launch:
+                await pilot.press("1")
+                await pilot.pause(delay=0.3)
+                mock_launch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_g_pushes_apps_screen(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = RemoteScreen(device, device_store=store)
+            app.push_screen(screen)
+            await pilot.pause(delay=0.3)
+            with patch.object(screen.remote, "get_apps", new_callable=AsyncMock, return_value=[]):
+                await pilot.press("g")
+                await pilot.pause(delay=0.5)
+            assert isinstance(app.screen, AppsScreen)
+
+
+# ---------------------------------------------------------------------------
+# AppsScreen
+# ---------------------------------------------------------------------------
+
+class TestAppsScreen:
+    def _make_store_with_device(self, tmp_path, favorites=None, app_cache=None):
+        """Helper: create a DeviceStore with one device."""
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        device = RokuDevice("Test", "Roku Ultra", "S123", "192.168.1.100")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        if favorites:
+            store.set_favorites("S123", favorites)
+        if app_cache is not None:
+            store._devices["S123"].app_cache = app_cache
+        store.save()
+        return DeviceStore(path), device
+
+    def _fake_apps(self):
+        return [
+            {"id": "12", "name": "Netflix", "type": "appl", "version": "4.1"},
+            {"id": "13", "name": "YouTube", "type": "appl", "version": "5.0"},
+            {"id": "14", "name": "Hulu", "type": "appl", "version": "3.2"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_renders_with_header_and_list(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            header = apps_screen.query_one("#apps-header")
+            assert "Test" in str(header.content)
+            app_list = apps_screen.query_one("#apps-list", ListView)
+            assert app_list is not None
+
+    @pytest.mark.asyncio
+    async def test_loads_from_cache_no_network(self, tmp_path):
+        from roku_tui.storage import _now_iso
+        cache = {
+            "fetched_at": _now_iso(),
+            "apps": self._fake_apps(),
+        }
+        store, device = self._make_store_with_device(tmp_path, app_cache=cache)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock) as mock_get:
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+                mock_get.assert_not_called()
+
+            status = apps_screen.query_one("#apps-status", Static)
+            assert "cache" in str(status.content).lower()
+
+    @pytest.mark.asyncio
+    async def test_fetches_when_cache_expired(self, tmp_path):
+        from datetime import datetime, timezone
+        old_ts = datetime(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+        cache = {"fetched_at": old_ts, "apps": []}
+        store, device = self._make_store_with_device(tmp_path, app_cache=cache)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()) as mock_get:
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+                mock_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fetches_when_no_cache(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()) as mock_get:
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+                mock_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_via_r_key(self, tmp_path):
+        from roku_tui.storage import _now_iso
+        cache = {"fetched_at": _now_iso(), "apps": self._fake_apps()}
+        store, device = self._make_store_with_device(tmp_path, app_cache=cache)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()) as mock_get:
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+                # Initial load uses cache, so no call yet
+                mock_get.assert_not_called()
+                # Force refresh
+                await pilot.press("r")
+                await pilot.pause(delay=0.5)
+                mock_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_via_button(self, tmp_path):
+        from roku_tui.storage import _now_iso
+        cache = {"fetched_at": _now_iso(), "apps": self._fake_apps()}
+        store, device = self._make_store_with_device(tmp_path, app_cache=cache)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()) as mock_get:
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+                mock_get.assert_not_called()
+                await pilot.click("#refresh-btn")
+                await pilot.pause(delay=0.5)
+                mock_get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_select_app_launches_it(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            with patch.object(remote, "launch_app", new_callable=AsyncMock) as mock_launch:
+                app_list = apps_screen.query_one("#apps-list", ListView)
+                app_list.focus()
+                await pilot.pause(delay=0.2)
+                app_list.index = 0
+                await pilot.pause(delay=0.2)
+                await pilot.press("enter")
+                await pilot.pause(delay=0.5)
+                mock_launch.assert_called_with("12")
+
+    @pytest.mark.asyncio
+    async def test_toggle_favorite_adds_and_removes(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            app_list = apps_screen.query_one("#apps-list", ListView)
+            app_list.focus()
+            await pilot.pause(delay=0.2)
+            app_list.index = 0
+            await pilot.pause(delay=0.2)
+
+            # Add favorite
+            await pilot.press("f")
+            await pilot.pause(delay=0.3)
+            assert "12" in apps_screen._favorite_ids
+
+            # Re-set index after list repopulation, then remove favorite
+            app_list.index = 0
+            await pilot.pause(delay=0.2)
+            await pilot.press("f")
+            await pilot.pause(delay=0.3)
+            assert "12" not in apps_screen._favorite_ids
+
+    @pytest.mark.asyncio
+    async def test_toggle_favorite_max_five(self, tmp_path):
+        store, device = self._make_store_with_device(
+            tmp_path, favorites=["1", "2", "3", "4", "5"]
+        )
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        fake_apps = [{"id": str(i), "name": f"App{i}"} for i in range(1, 8)]
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=fake_apps):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            app_list = apps_screen.query_one("#apps-list", ListView)
+            app_list.focus()
+            await pilot.pause(delay=0.2)
+            # Select app 6 (index 5)
+            app_list.index = 5
+            await pilot.pause(delay=0.2)
+            await pilot.press("f")
+            await pilot.pause(delay=0.3)
+
+            # Should still be 5 favorites
+            assert len(apps_screen._favorite_ids) == 5
+            assert "6" not in apps_screen._favorite_ids
+            status = apps_screen.query_one("#apps-status", Static)
+            assert "Maximum" in str(status.content) or "5" in str(status.content)
+
+    @pytest.mark.asyncio
+    async def test_favorites_persisted_to_store(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(remote, "get_apps", new_callable=AsyncMock, return_value=self._fake_apps()):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            app_list = apps_screen.query_one("#apps-list", ListView)
+            app_list.focus()
+            await pilot.pause(delay=0.2)
+            app_list.index = 0
+            await pilot.pause(delay=0.2)
+            await pilot.press("f")
+            await pilot.pause(delay=0.3)
+
+        # Verify persisted
+        path = tmp_path / "devices.json"
+        data = json.loads(path.read_text())
+        assert "12" in data["devices"]["S123"]["favorites"]
+
+    @pytest.mark.asyncio
+    async def test_escape_returns_to_remote(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Push RemoteScreen first, then AppsScreen
+            remote_screen = RemoteScreen(device, device_store=store)
+            app.push_screen(remote_screen)
+            await pilot.pause(delay=0.3)
+
+            with patch.object(remote_screen.remote, "get_apps", new_callable=AsyncMock, return_value=[]):
+                apps_screen = AppsScreen(device, remote_screen.remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            assert isinstance(app.screen, AppsScreen)
+            await pilot.press("escape")
+            await pilot.pause(delay=0.3)
+            assert isinstance(app.screen, RemoteScreen)
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_shows_in_status(self, tmp_path):
+        store, device = self._make_store_with_device(tmp_path)
+        store.load()
+        from roku_tui.remote import RokuRemote
+        remote = RokuRemote(device)
+        app = RokuTUIApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            with patch.object(
+                remote,
+                "get_apps",
+                new_callable=AsyncMock,
+                side_effect=RokuError(ErrorCode.E1008, "unreachable"),
+            ):
+                apps_screen = AppsScreen(device, remote, device_store=store)
+                app.push_screen(apps_screen)
+                await pilot.pause(delay=0.5)
+
+            status = apps_screen.query_one("#apps-status", Static)
+            assert "E1008" in str(status.content)

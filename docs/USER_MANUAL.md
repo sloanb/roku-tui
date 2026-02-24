@@ -15,10 +15,13 @@ Control your Roku devices from the terminal.
 4. [Remote Control](#remote-control)
    - [Keyboard Shortcuts](#keyboard-shortcuts)
    - [On-Screen Buttons](#on-screen-buttons)
-5. [Persistent Storage](#persistent-storage)
+5. [Favorite Apps](#favorite-apps)
+   - [Managing Favorites](#managing-favorites)
+   - [Using Favorites](#using-favorites)
+6. [Persistent Storage](#persistent-storage)
    - [Configuration Directory](#configuration-directory)
    - [Saved Device Data](#saved-device-data)
-6. [Troubleshooting](#troubleshooting)
+7. [Troubleshooting](#troubleshooting)
    - [Error Code Reference](#error-code-reference)
    - [Common Issues](#common-issues)
 
@@ -177,6 +180,13 @@ Keyboard input is the fastest way to control your Roku. All shortcuts work regar
 | **-** (minus) | Volume down |
 | **m** | Mute / unmute |
 
+#### Favorites & Apps
+
+| Key | Action |
+|-----|--------|
+| **g** | Open the apps browser to manage favorites |
+| **1** - **5** | Launch favorite app in that slot |
+
 #### Screen Navigation
 
 | Key | Action |
@@ -206,6 +216,50 @@ The remote control panel is organized into four sections. All buttons are clicka
 - **Vol -** -- decrease volume
 - **Mute** -- toggle mute
 - **Vol +** -- increase volume
+
+---
+
+## Favorite Apps
+
+You can mark up to 5 installed apps as favorites for quick access. Favorites appear as numbered buttons on the Remote Screen and can be launched instantly with the **1**-**5** keys.
+
+Each device has its own set of favorites, so your Living Room Roku and Bedroom Roku can have different shortcuts.
+
+### Managing Favorites
+
+1. From the Remote Screen, press **g** to open the **Apps Screen**.
+2. The Apps Screen shows all installed apps on the device. Apps marked as favorites have a **\*** prefix.
+3. Use the arrow keys to highlight an app, then press **f** to toggle it as a favorite.
+4. Press **Enter** on any app to launch it immediately.
+5. Press **r** or click **Refresh** to force-reload the app list from the device.
+6. Press **Esc** to return to the Remote Screen.
+
+The maximum number of favorites is 5. If you try to add a 6th, an error message is shown.
+
+### Using Favorites
+
+Once you've set up favorites, the Remote Screen shows a favorites bar between the device banner and the remote panel:
+
+```
+[1: Netflix] [2: YouTube] [3: Hulu]
+```
+
+- Press **1** through **5** to launch the corresponding favorite app.
+- Click a favorite button with the mouse to launch it.
+- If a slot is empty, the key press is ignored.
+
+### App List Caching
+
+The list of installed apps is cached for 24 hours to avoid repeated network fetches. The cache is per-device and stored alongside other device data. When the cache expires, the app list is automatically re-fetched the next time you open the Apps Screen. Press **r** on the Apps Screen to force a refresh at any time.
+
+### Apps Screen Keybindings
+
+| Key | Action |
+|-----|--------|
+| **Enter** | Launch selected app |
+| **f** | Toggle favorite on selected app |
+| **r** | Force-refresh app list from device |
+| **Esc** | Return to Remote Screen |
 
 ---
 
@@ -243,6 +297,8 @@ Each saved device records the following information:
 | **first_seen** | When the device was first discovered |
 | **last_seen** | When the device was last seen during a scan |
 | **last_connected** | When you last selected the device for remote control |
+| **favorites** | List of up to 5 favorite app IDs |
+| **app_cache** | Cached list of installed apps with a 24-hour TTL |
 
 Devices are identified by serial number. If the serial number is unavailable, the device is identified by its `host:port` combination instead.
 

@@ -14,7 +14,7 @@ from textual import events, work
 from .discovery import RokuDevice, connect_device, discover_devices
 from .errors import RokuError
 from .remote import RokuKey, RokuRemote
-from .storage import DeviceStore, _device_key
+from .storage import DeviceStore, _device_key, is_cache_valid
 
 log = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ class DeviceScreen(Screen):
                 self.device_store.save()
             except Exception:
                 log.exception("Failed to update last_connected")
-            self.app.push_screen(RemoteScreen(device))
+            self.app.push_screen(RemoteScreen(device, device_store=self.device_store))
 
     def _repopulate_saved(self) -> None:
         """Re-add saved devices to the list (used after scan clears it)."""
@@ -323,6 +323,27 @@ class RemoteScreen(Screen):
         width: 100%;
     }
 
+    #favorites-bar {
+        height: auto;
+        align: center middle;
+        padding: 0 2;
+        margin: 0 0 0 0;
+    }
+
+    .fav-btn {
+        min-width: 18;
+        height: 3;
+        margin: 0 1;
+        background: $secondary;
+    }
+
+    .fav-hint {
+        text-align: center;
+        color: $text-muted;
+        padding: 1 0;
+        width: 100%;
+    }
+
     #remote-panel {
         width: 60;
         padding: 1 2;
@@ -401,18 +422,31 @@ class RemoteScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "go_back", "Devices", priority=True),
+        Binding("g", "open_apps", "Apps"),
     ]
 
-    def __init__(self, device: RokuDevice) -> None:
+    def __init__(
+        self,
+        device: RokuDevice,
+        device_store: DeviceStore | None = None,
+    ) -> None:
         super().__init__()
         self.device = device
         self.remote = RokuRemote(device)
+        self._device_store = device_store
+        self._device_key: str | None = None
+        self._favorites: list[dict] = []  # resolved dicts with id+name
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(
             f"Connected: {self.device.name} ({self.device.host})", id="device-banner"
         )
+        with Horizontal(id="favorites-bar"):
+            yield Static(
+                "No favorites -- press [bold]g[/bold] to manage apps",
+                classes="fav-hint",
+            )
 
         with Container(id="remote-panel"):
             # Power / Home / Back
@@ -456,12 +490,76 @@ class RemoteScreen(Screen):
             "Keys: Arrows=Navigate  Enter=OK  Space=Play/Pause  "
             "h=Home  b=Back  p=Power\n"
             "r=Rewind  f=Forward  =/Vol+  -/Vol-  m=Mute  i=Info  "
-            "Esc=Back to devices",
+            "g=Apps  1-5=Favorites  Esc=Back to devices",
             id="help-text",
         )
         yield Footer()
 
+    def on_mount(self) -> None:
+        self._device_key = _device_key(self.device)
+        self._load_favorites()
+
+    def _load_favorites(self) -> None:
+        """Resolve favorite IDs to name+id dicts from stored cache."""
+        self._favorites = []
+        if not self._device_store or not self._device_key:
+            self._refresh_favorites_bar()
+            return
+        try:
+            saved = self._device_store.devices.get(self._device_key)
+            if not saved or not saved.favorites:
+                self._refresh_favorites_bar()
+                return
+            # Build a lookup from app_cache
+            app_lookup: dict[str, str] = {}
+            if saved.app_cache and isinstance(saved.app_cache.get("apps"), list):
+                for app in saved.app_cache["apps"]:
+                    aid = app.get("id")
+                    aname = app.get("name")
+                    if aid:
+                        app_lookup[str(aid)] = aname or f"App {aid}"
+            for fav_id in saved.favorites[:5]:
+                name = app_lookup.get(str(fav_id), f"App {fav_id}")
+                self._favorites.append({"id": str(fav_id), "name": name})
+        except Exception:
+            log.exception("Failed to load favorites")
+        self._refresh_favorites_bar()
+
+    @work(exclusive=True, group="refresh-fav")
+    async def _refresh_favorites_bar(self) -> None:
+        """Clear and re-populate the favorites bar."""
+        try:
+            bar = self.query_one("#favorites-bar", Horizontal)
+        except Exception:
+            return
+        await bar.remove_children()
+        if not self._favorites:
+            await bar.mount(
+                Static(
+                    "No favorites -- press [bold]g[/bold] to manage apps",
+                    classes="fav-hint",
+                )
+            )
+        else:
+            for i, fav in enumerate(self._favorites):
+                await bar.mount(
+                    RemoteButton(
+                        f"{i + 1}: {fav['name']}",
+                        id=f"fav-{i}",
+                        classes="fav-btn",
+                    )
+                )
+
     def on_key(self, event: events.Key) -> None:
+        # Handle digit keys 1-5 for favorites
+        if event.key in ("1", "2", "3", "4", "5"):
+            idx = int(event.key) - 1
+            if idx < len(self._favorites):
+                self._launch_favorite(self._favorites[idx]["id"])
+                event.prevent_default()
+                event.stop()
+            return
+
         roku_key = _KEY_MAP.get(event.key)
         if roku_key:
             self._send_key(roku_key)
@@ -469,11 +567,25 @@ class RemoteScreen(Screen):
             event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id and event.button.id.startswith("fav-"):
+            try:
+                idx = int(event.button.id.split("-")[1])
+                if idx < len(self._favorites):
+                    self._launch_favorite(self._favorites[idx]["id"])
+            except (ValueError, IndexError):
+                pass
+            return
         if event.button.id and event.button.id in _BUTTON_MAP:
             self._send_key(_BUTTON_MAP[event.button.id])
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
+
+    def action_open_apps(self) -> None:
+        self.app.push_screen(
+            AppsScreen(self.device, self.remote, device_store=self._device_store),
+            callback=lambda _: self._load_favorites(),
+        )
 
     @work
     async def _send_key(self, key: RokuKey) -> None:
@@ -486,8 +598,222 @@ class RemoteScreen(Screen):
         except Exception as exc:
             status.update(f"[bold red]Failed:[/] {exc}")
 
+    @work
+    async def _launch_favorite(self, app_id: str) -> None:
+        status = self.query_one("#status", Static)
+        try:
+            await self.remote.launch_app(app_id)
+            status.update(f"Launched app {app_id}")
+        except RokuError as exc:
+            status.update(f"[bold red]Error:[/] {exc}")
+        except Exception as exc:
+            status.update(f"[bold red]Failed:[/] {exc}")
+
     async def on_unmount(self) -> None:
         await self.remote.close()
+
+
+class AppsScreen(Screen):
+    """Screen for browsing installed apps and managing favorites."""
+
+    DEFAULT_CSS = """
+    AppsScreen {
+        layout: vertical;
+    }
+
+    #apps-header {
+        text-align: center;
+        padding: 1 2;
+        text-style: bold;
+        color: $text;
+        background: $primary;
+        width: 100%;
+    }
+
+    #apps-toolbar {
+        height: auto;
+        padding: 0 2;
+        align: right middle;
+    }
+
+    #refresh-btn {
+        margin: 0 2;
+    }
+
+    #apps-list-container {
+        height: 1fr;
+        padding: 0 2;
+    }
+
+    #apps-status {
+        height: 3;
+        padding: 1 2;
+        text-align: center;
+        color: $text-muted;
+    }
+
+    #apps-help {
+        text-align: center;
+        color: $text-muted;
+        padding: 1;
+        border-top: solid $primary-darken-2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "go_back", "Back", priority=True),
+        Binding("f", "toggle_favorite", "Fav", priority=True),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    def __init__(
+        self,
+        device: RokuDevice,
+        remote: RokuRemote,
+        device_store: DeviceStore | None = None,
+    ) -> None:
+        super().__init__()
+        self.device = device
+        self.remote = remote
+        self._device_store = device_store
+        self._device_key = _device_key(device)
+        self._apps: list[dict] = []
+        self._favorite_ids: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"Apps: {self.device.name}", id="apps-header")
+        with Horizontal(id="apps-toolbar"):
+            yield Button("Refresh", id="refresh-btn", variant="primary")
+        with Container(id="apps-list-container"):
+            yield ListView(id="apps-list")
+        yield Static("Loading apps...", id="apps-status")
+        yield Static(
+            "Enter=Launch  f=Toggle Favorite  r=Refresh  Esc=Back",
+            id="apps-help",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        # Load favorite IDs from store
+        if self._device_store:
+            try:
+                saved = self._device_store.devices.get(self._device_key)
+                if saved and saved.favorites:
+                    self._favorite_ids = set(str(f) for f in saved.favorites)
+            except Exception:
+                log.exception("Failed to load favorite IDs")
+        self._load_apps()
+
+    @work(exclusive=True)
+    async def _load_apps(self, force_refresh: bool = False) -> None:
+        status = self.query_one("#apps-status", Static)
+        status.update("Loading apps...")
+        apps = None
+
+        # Try cache first
+        if not force_refresh and self._device_store:
+            try:
+                saved = self._device_store.devices.get(self._device_key)
+                if saved and is_cache_valid(saved.app_cache):
+                    apps = saved.app_cache["apps"]
+                    status.update(f"Loaded {len(apps)} app(s) from cache")
+            except Exception:
+                log.exception("Failed to read app cache")
+
+        # Fetch from device if no cache
+        if apps is None:
+            try:
+                apps = await self.remote.get_apps()
+                # Update cache in store
+                if self._device_store:
+                    try:
+                        self._device_store.set_app_cache(self._device_key, apps)
+                        self._device_store.save()
+                    except Exception:
+                        log.exception("Failed to save app cache")
+                status.update(f"Fetched {len(apps)} app(s) from device")
+            except RokuError as exc:
+                status.update(f"[bold red]Error:[/] {exc}")
+                return
+            except Exception as exc:
+                status.update(f"[bold red]Failed:[/] {exc}")
+                return
+
+        self._apps = apps
+        self._populate_list()
+
+    def _populate_list(self) -> None:
+        app_list = self.query_one("#apps-list", ListView)
+        app_list.clear()
+        for app in self._apps:
+            app_id = str(app.get("id", ""))
+            app_name = app.get("name", "Unknown")
+            star = "* " if app_id in self._favorite_ids else "  "
+            app_list.append(
+                ListItem(Label(f"{star}{app_name}  [dim](id: {app_id})[/dim]"))
+            )
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._apps):
+            app_id = str(self._apps[idx].get("id", ""))
+            if app_id:
+                self._launch_app(app_id)
+
+    @work
+    async def _launch_app(self, app_id: str) -> None:
+        status = self.query_one("#apps-status", Static)
+        try:
+            await self.remote.launch_app(app_id)
+            status.update(f"Launched app {app_id}")
+        except RokuError as exc:
+            status.update(f"[bold red]Error:[/] {exc}")
+        except Exception as exc:
+            status.update(f"[bold red]Failed:[/] {exc}")
+
+    def action_go_back(self) -> None:
+        self.dismiss(None)
+
+    def action_toggle_favorite(self) -> None:
+        app_list = self.query_one("#apps-list", ListView)
+        idx = app_list.index
+        if idx is None or idx < 0 or idx >= len(self._apps):
+            return
+
+        app_id = str(self._apps[idx].get("id", ""))
+        if not app_id:
+            return
+
+        status = self.query_one("#apps-status", Static)
+        if app_id in self._favorite_ids:
+            self._favorite_ids.discard(app_id)
+            status.update(f"Removed app {app_id} from favorites")
+        else:
+            if len(self._favorite_ids) >= 5:
+                status.update("[bold red]Error:[/] Maximum 5 favorites allowed")
+                return
+            self._favorite_ids.add(app_id)
+            status.update(f"Added app {app_id} to favorites")
+
+        # Persist
+        if self._device_store:
+            try:
+                self._device_store.set_favorites(
+                    self._device_key, list(self._favorite_ids)
+                )
+                self._device_store.save()
+            except Exception:
+                log.exception("Failed to save favorites")
+
+        self._populate_list()
+
+    def action_refresh(self) -> None:
+        self._load_apps(force_refresh=True)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "refresh-btn":
+            self._load_apps(force_refresh=True)
 
 
 class RokuTUIApp(App):

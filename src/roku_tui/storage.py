@@ -18,6 +18,22 @@ log = logging.getLogger(__name__)
 _APP_DIR = "roku-tui"
 _DEVICES_FILE = "devices.json"
 _SCHEMA_VERSION = 1
+_CACHE_TTL_HOURS = 24
+
+
+def is_cache_valid(app_cache: dict | None) -> bool:
+    """Return True if *app_cache* exists and its ``fetched_at`` is within the TTL."""
+    if app_cache is None:
+        return False
+    fetched_at = app_cache.get("fetched_at")
+    if not fetched_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(fetched_at)
+        age = datetime.now(timezone.utc) - ts
+        return age.total_seconds() < _CACHE_TTL_HOURS * 3600
+    except (ValueError, TypeError):
+        return False
 
 
 def get_config_dir() -> Path:
@@ -77,9 +93,11 @@ class SavedDevice:
     last_connected: str | None = None
     first_seen: str = field(default_factory=_now_iso)
     last_seen: str = field(default_factory=_now_iso)
+    favorites: list[str] = field(default_factory=list)
+    app_cache: dict | None = field(default=None)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "model": self.model,
             "serial": self.serial,
@@ -90,11 +108,18 @@ class SavedDevice:
             "last_connected": self.last_connected,
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
+            "favorites": self.favorites,
         }
+        if self.app_cache is not None:
+            d["app_cache"] = self.app_cache
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> SavedDevice:
         now = _now_iso()
+        raw_favs = data.get("favorites", [])
+        if not isinstance(raw_favs, list):
+            raw_favs = []
         return cls(
             name=data.get("name", "Unknown"),
             model=data.get("model", "Unknown"),
@@ -106,6 +131,8 @@ class SavedDevice:
             last_connected=data.get("last_connected"),
             first_seen=data.get("first_seen", now),
             last_seen=data.get("last_seen", now),
+            favorites=raw_favs,
+            app_cache=data.get("app_cache"),
         )
 
     def to_roku_device(self) -> RokuDevice:
@@ -231,6 +258,21 @@ class DeviceStore:
         device = self._devices.get(key)
         if device is not None:
             device.last_connected = _now_iso()
+
+    def set_favorites(self, key: str, favorites: list[str]) -> None:
+        """Store up to 5 favorite app IDs for the given device."""
+        device = self._devices.get(key)
+        if device is not None:
+            device.favorites = list(favorites[:5])
+
+    def set_app_cache(self, key: str, apps: list[dict]) -> None:
+        """Store the app list cache with a current timestamp."""
+        device = self._devices.get(key)
+        if device is not None:
+            device.app_cache = {
+                "fetched_at": _now_iso(),
+                "apps": apps,
+            }
 
     def _backup(self) -> None:
         """Backup the current file to .json.bak."""
