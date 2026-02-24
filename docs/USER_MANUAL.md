@@ -18,10 +18,13 @@ Control your Roku devices from the terminal.
 5. [Favorite Apps](#favorite-apps)
    - [Managing Favorites](#managing-favorites)
    - [Using Favorites](#using-favorites)
-6. [Persistent Storage](#persistent-storage)
+6. [Private Listening](#private-listening)
+   - [Installing Audio Dependencies](#installing-audio-dependencies)
+   - [Using Private Listening](#using-private-listening)
+7. [Persistent Storage](#persistent-storage)
    - [Configuration Directory](#configuration-directory)
    - [Saved Device Data](#saved-device-data)
-7. [Troubleshooting](#troubleshooting)
+8. [Troubleshooting](#troubleshooting)
    - [Error Code Reference](#error-code-reference)
    - [Common Issues](#common-issues)
 
@@ -40,6 +43,30 @@ Control your Roku devices from the terminal.
 git clone <repository-url>
 cd roku-tui
 pip install .
+```
+
+### Optional: Audio Dependencies
+
+Private listening requires additional packages. Install them with the `audio` extra:
+
+```bash
+pip install ".[audio]"
+```
+
+On Linux, you also need system libraries for PortAudio and Opus:
+
+```bash
+# Debian/Ubuntu
+sudo apt install libportaudio2 libopus0
+
+# Arch
+sudo pacman -S portaudio opus
+```
+
+On macOS, install via Homebrew:
+
+```bash
+brew install portaudio opus
 ```
 
 For development (includes test dependencies):
@@ -187,6 +214,12 @@ Keyboard input is the fastest way to control your Roku. All shortcuts work regar
 | **g** | Open the apps browser to manage favorites |
 | **1** - **5** | Launch favorite app in that slot |
 
+#### Audio
+
+| Key | Action |
+|-----|--------|
+| **l** | Toggle private listening on/off |
+
 #### Screen Navigation
 
 | Key | Action |
@@ -263,6 +296,59 @@ The list of installed apps is cached for 24 hours to avoid repeated network fetc
 
 ---
 
+## Private Listening
+
+Private listening streams audio from your Roku to your computer's speakers or headphones. This is the same feature available in the official Roku mobile app -- useful for watching TV without disturbing others, or when the TV speakers aren't ideal.
+
+### Installing Audio Dependencies
+
+Private listening is an optional feature. If the audio packages aren't installed, pressing **l** shows installation instructions in the status bar.
+
+Install the audio dependencies:
+
+```bash
+pip install "roku-tui[audio]"
+```
+
+You also need system libraries (see [Installation](#installation) above).
+
+### Using Private Listening
+
+1. Connect to a Roku device and open the Remote Screen.
+2. Press **l** or click the **Listen** button.
+3. The status indicator shows the connection progress:
+   - **Connecting...** -- establishing the WebSocket session and authenticating
+   - **Handshaking...** -- negotiating audio stream parameters with the Roku
+   - **Streaming** -- audio is playing through your computer
+4. Press **l** again or click **Listen** to stop.
+
+Audio plays through your system's default audio output device. Use your OS volume controls or the Roku volume keys (**=**/**-**/**m**) to adjust levels.
+
+### How It Works
+
+Private listening uses a WebSocket-based protocol (ECP-2) to authenticate with the Roku and request an audio stream. The Roku then sends Opus-encoded audio over RTP (UDP port 6970), which is decoded and played in real time. An RTCP control channel handles synchronization and keepalive.
+
+### Private Listening Troubleshooting
+
+**"Audio deps missing" when pressing l**
+- Install the audio extras: `pip install "roku-tui[audio]"`
+- Ensure `libportaudio2` and `libopus0` are installed on your system.
+
+**Status shows "Connecting..." but never advances**
+- Check that your Roku is on and playing content.
+- Ensure no firewall is blocking WebSocket connections to port 8060.
+
+**Status shows "Streaming" but no audio is heard**
+- Check your system's audio output device and volume.
+- Ensure no firewall is blocking incoming UDP traffic on port 6970.
+- Try stopping and restarting private listening.
+
+**Audio has choppy playback or high latency**
+- This can happen on slow networks or under high CPU load.
+- Ensure your computer and Roku are on the same subnet (avoid routing through a VPN).
+
+---
+
 ## Persistent Storage
 
 ### Configuration Directory
@@ -333,6 +419,11 @@ When something goes wrong, the status bar displays an error with a code. Here is
 | **E1008** | Device unreachable | The Roku is not responding on the network. |
 | **E1009** | Parse error | The device returned malformed data. |
 | **E1010** | Socket error | A low-level network error occurred. |
+| **E1011** | Audio session failed | The private listening session encountered an error. |
+| **E1012** | WebSocket error | The ECP-2 WebSocket connection failed. Check that the Roku is reachable. |
+| **E1013** | Auth failed | ECP-2 authentication was rejected by the Roku. |
+| **E1014** | Audio pipeline error | The RTP receive or audio playback pipeline failed. |
+| **E1015** | Audio deps missing | Optional audio packages not installed. Run `pip install "roku-tui[audio]"`. |
 
 ### Common Issues
 
