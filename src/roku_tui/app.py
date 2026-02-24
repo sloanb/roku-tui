@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal
@@ -12,6 +14,9 @@ from textual import events, work
 from .discovery import RokuDevice, connect_device, discover_devices
 from .errors import RokuError
 from .remote import RokuKey, RokuRemote
+from .storage import DeviceStore, _device_key
+
+log = logging.getLogger(__name__)
 
 # Maps keyboard keys to Roku remote keys
 _KEY_MAP: dict[str, RokuKey] = {
@@ -112,9 +117,11 @@ class DeviceScreen(Screen):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, device_store: DeviceStore | None = None) -> None:
         super().__init__()
         self.devices: list[RokuDevice] = []
+        self.device_store = device_store or DeviceStore()
+        self._saved_serials: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -127,6 +134,29 @@ class DeviceScreen(Screen):
             yield ListView(id="device-list")
         yield Static("Press [bold]s[/bold] to scan or [bold]a[/bold] to enter an IP", id="status-bar")
         yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            saved = self.device_store.load()
+        except Exception:
+            log.exception("Failed to load saved devices")
+            return
+        if saved:
+            device_list = self.query_one("#device-list", ListView)
+            for key, sd in saved.items():
+                rd = sd.to_roku_device()
+                self.devices.append(rd)
+                self._saved_serials.add(key)
+                device_list.append(
+                    ListItem(Label(
+                        f"  {rd.name}  --  {rd.model}  ({rd.host}) [dim](saved)[/dim]"
+                    ))
+                )
+            status = self.query_one("#status-bar", Static)
+            status.update(
+                f"Loaded [bold]{len(saved)}[/] saved device(s). "
+                "Press [bold]s[/bold] to scan or select a device."
+            )
 
     def action_scan(self) -> None:
         self._run_scan()
@@ -147,7 +177,34 @@ class DeviceScreen(Screen):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         idx = event.list_view.index
         if idx is not None and 0 <= idx < len(self.devices):
-            self.app.push_screen(RemoteScreen(self.devices[idx]))
+            device = self.devices[idx]
+            try:
+                key = _device_key(device)
+                self.device_store.mark_connected(key)
+                self.device_store.save()
+            except Exception:
+                log.exception("Failed to update last_connected")
+            self.app.push_screen(RemoteScreen(device))
+
+    def _repopulate_saved(self) -> None:
+        """Re-add saved devices to the list (used after scan clears it)."""
+        device_list = self.query_one("#device-list", ListView)
+        try:
+            saved = self.device_store.load()
+        except Exception:
+            log.exception("Failed to reload saved devices")
+            return
+        discovered_keys = {_device_key(d) for d in self.devices}
+        for key, sd in saved.items():
+            if key not in discovered_keys:
+                rd = sd.to_roku_device()
+                self.devices.append(rd)
+                self._saved_serials.add(key)
+                device_list.append(
+                    ListItem(Label(
+                        f"  {rd.name}  --  {rd.model}  ({rd.host}) [dim](saved)[/dim]"
+                    ))
+                )
 
     @work(exclusive=True)
     async def _run_scan(self) -> None:
@@ -156,24 +213,40 @@ class DeviceScreen(Screen):
         status.update("Scanning network...")
         device_list.clear()
         self.devices.clear()
+        self._saved_serials.clear()
 
         try:
             self.devices = await discover_devices(timeout=5.0)
         except RokuError as exc:
             status.update(f"[bold red]Error:[/] {exc}")
+            self._repopulate_saved()
             return
         except Exception as exc:
             status.update(f"[bold red]Scan failed:[/] {exc}")
+            self._repopulate_saved()
             return
+
+        # Merge discovered devices into store
+        try:
+            for device in self.devices:
+                self.device_store.merge_device(device)
+            self.device_store.save()
+        except Exception:
+            log.exception("Failed to save discovered devices")
 
         if not self.devices:
             status.update("No Roku devices found. Press [bold]s[/bold] to retry.")
+            self._repopulate_saved()
             return
 
         for device in self.devices:
             device_list.append(
                 ListItem(Label(f"  {device.name}  --  {device.model}  ({device.host})"))
             )
+
+        # Re-add saved devices that weren't discovered
+        self._repopulate_saved()
+
         status.update(
             f"Found [bold]{len(self.devices)}[/] device(s). "
             "Select one to begin controlling it."
@@ -212,6 +285,13 @@ class DeviceScreen(Screen):
         except Exception as exc:
             status.update(f"[bold red]Connect failed:[/] {exc}")
             return
+
+        # Merge into store
+        try:
+            self.device_store.merge_device(device)
+            self.device_store.save()
+        except Exception:
+            log.exception("Failed to save connected device")
 
         self.devices.append(device)
         device_list = self.query_one("#device-list", ListView)
@@ -426,5 +506,9 @@ class RokuTUIApp(App):
         Binding("q", "quit", "Quit"),
     ]
 
+    def __init__(self, device_store: DeviceStore | None = None) -> None:
+        super().__init__()
+        self.device_store = device_store or DeviceStore()
+
     def on_mount(self) -> None:
-        self.push_screen(DeviceScreen())
+        self.push_screen(DeviceScreen(device_store=self.device_store))

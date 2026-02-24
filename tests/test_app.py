@@ -1,5 +1,6 @@
 """Tests for the TUI application screens and interactions."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,6 +17,7 @@ from roku_tui.app import (
 from roku_tui.discovery import RokuDevice
 from roku_tui.errors import ErrorCode, RokuError
 from roku_tui.remote import RokuKey
+from roku_tui.storage import DeviceStore, SavedDevice
 
 
 # ---------------------------------------------------------------------------
@@ -426,3 +428,103 @@ class TestRemoteScreen:
             for btn_id in _BUTTON_MAP:
                 btn = screen.query_one(f"#{btn_id}")
                 assert btn is not None
+
+
+# ---------------------------------------------------------------------------
+# Device Persistence
+# ---------------------------------------------------------------------------
+
+class TestDeviceScreenPersistence:
+    @pytest.mark.asyncio
+    async def test_saved_devices_loaded_on_mount(self, tmp_path):
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        device = RokuDevice("Saved TV", "Ultra", "SAV1", "10.0.0.10")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        store.save()
+
+        app = RokuTUIApp(device_store=DeviceStore(path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(delay=0.3)
+            assert len(app.screen.devices) == 1
+            assert app.screen.devices[0].name == "Saved TV"
+            status = app.screen.query_one("#status-bar")
+            assert "saved" in str(status.content).lower()
+
+    @pytest.mark.asyncio
+    async def test_scan_merges_with_saved(self, tmp_path):
+        # Pre-save a device
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        saved_dev = RokuDevice("Old TV", "Express", "SAV2", "10.0.0.20")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(saved_dev)
+        store.save()
+
+        # Scan discovers a different device
+        discovered = [RokuDevice("New TV", "Ultra", "DISC1", "10.0.0.30")]
+        app = RokuTUIApp(device_store=DeviceStore(path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(delay=0.3)
+            with patch("roku_tui.app.discover_devices", new_callable=AsyncMock, return_value=discovered):
+                with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+                    await pilot.press("s")
+                    await pilot.pause(delay=0.5)
+
+            # Both devices should be in the list
+            assert len(app.screen.devices) == 2
+            names = {d.name for d in app.screen.devices}
+            assert "New TV" in names
+            assert "Old TV" in names
+
+    @pytest.mark.asyncio
+    async def test_manual_connect_saves_device(self, tmp_path):
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        store.save()
+
+        fake_device = RokuDevice("Manual TV", "Express", "MAN1", "10.0.0.40")
+        app = RokuTUIApp(device_store=DeviceStore(path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            ip_input = app.screen.query_one("#ip-input", Input)
+            ip_input.value = "10.0.0.40"
+
+            with patch("roku_tui.app.connect_device", new_callable=AsyncMock, return_value=fake_device):
+                with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+                    await pilot.click("#connect-btn")
+                    await pilot.pause(delay=0.5)
+
+        # Verify persisted to disk
+        data = json.loads(path.read_text())
+        assert "MAN1" in data["devices"]
+        assert data["devices"]["MAN1"]["name"] == "Manual TV"
+
+    @pytest.mark.asyncio
+    async def test_selecting_device_updates_last_connected(self, tmp_path):
+        path = tmp_path / "devices.json"
+        store = DeviceStore(path)
+        store.load()
+        device = RokuDevice("TV", "Ultra", "SEL1", "10.0.0.50")
+        with patch("roku_tui.storage.get_local_subnet", return_value=(None, None)):
+            store.merge_device(device)
+        store.save()
+        assert store.devices["SEL1"].last_connected is None
+
+        app = RokuTUIApp(device_store=DeviceStore(path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(delay=0.3)
+            device_list = app.screen.query_one("#device-list", ListView)
+            device_list.focus()
+            await pilot.pause(delay=0.2)
+            device_list.index = 0
+            await pilot.pause(delay=0.2)
+            await pilot.press("enter")
+            await pilot.pause(delay=0.5)
+
+        # Verify last_connected was written to disk
+        data = json.loads(path.read_text())
+        assert data["devices"]["SEL1"]["last_connected"] is not None
