@@ -31,7 +31,7 @@ _KEY_MAP: dict[str, RokuKey] = {
     "i": RokuKey.INFO,
     "r": RokuKey.REV,
     "f": RokuKey.FWD,
-    "equal_sign": RokuKey.VOLUME_UP,
+    "equals_sign": RokuKey.VOLUME_UP,
     "minus": RokuKey.VOLUME_DOWN,
     "m": RokuKey.VOLUME_MUTE,
     "p": RokuKey.POWER,
